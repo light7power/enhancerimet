@@ -1,0 +1,46 @@
+name: Publish Release and Package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build release APK
+        run: ./gradlew :app:assembleRelease
+
+      - name: Publish Maven package
+        run: ./gradlew :app:publishReleasePublicationToGitHubPackagesRepository
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: true
+          files: app/build/outputs/apk/release/app-release-unsigned.apk
+          body: |
+            测试版本：Rimet 8.5.5 / versionCode 1274。
+
+            已知问题：部分场景下自己撤回消息仍可能停留在“消息撤回中…”，欢迎提交 Issue 或 Pull Request 协助修复。
