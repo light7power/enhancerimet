@@ -12,6 +12,7 @@ import java.lang.reflect.Method;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -37,6 +38,11 @@ public final class DingTalkModule extends XposedModule {
     private static final String KEY_MASK_READ = "mask_read";
     private static final Map<Long, String> pendingRecallNotices = new ConcurrentHashMap<>();
     private static final Map<Long, Object> recallSnapshots = new ConcurrentHashMap<>();
+    private static final ThreadLocal<Set<Long>> ownRecallIds = new ThreadLocal<>();
+    private static final ThreadLocal<Integer> incomingRecallDepth = new ThreadLocal<>();
+    private static final ThreadLocal<Integer> localRecallDepth = new ThreadLocal<>();
+    private static final ThreadLocal<Integer> resolvedRecallCount = new ThreadLocal<>();
+    private static final ThreadLocal<Boolean> containsForeignRecall = new ThreadLocal<>();
     private SharedPreferences remotePrefs;
     private boolean installed;
 
@@ -82,8 +88,10 @@ public final class DingTalkModule extends XposedModule {
                         final Object[] snapshotHolder = new Object[1];
                         Object message = chain.getArg(1);
                         Object status = chain.getArg(2);
-                        if (enabled(KEY_ANTI_RECALL, true)
-                                && message != null && Integer.valueOf(1).equals(status)) {
+                        if (enabled(KEY_ANTI_RECALL, true) && isIncomingRecallContext()
+                                && !isLocalRecallContext()
+                                && message != null && Integer.valueOf(1).equals(status)
+                                && messageIdentity(cl, message) < 0) {
                             // Read the display name from the live message before cloning it.
                             String notice = senderLabel(message)
                                     + "尝试撤回上一条消息 [已阻止]";
@@ -105,8 +113,10 @@ public final class DingTalkModule extends XposedModule {
             // f0 hook below restores the copied message after that notification.
             Class<?> store = findObfuscatedClass(cl, "ofi");
             Class<?> contentValues = Class.forName(CONTENT_VALUES, false, cl);
+            installIncomingRecallContextHooks(cl);
+            installLocalRecallContextHooks(cl, messageCache);
             installBulkRecallSnapshotHook(cl, store);
-            installRecallDatabaseGuardHook(cl, store, contentValues);
+            installRecallCapabilityHook(cl, messageImpl);
             installBulkRecallRestoreHook(cl, messageCache, messageImpl);
             installRecallRowHook(cl);
             installLegacyRecallRowHook(cl);
@@ -127,11 +137,13 @@ public final class DingTalkModule extends XposedModule {
                 .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                 .intercept(chain -> {
                     Object result = chain.proceed();
-                    if (enabled(KEY_ANTI_RECALL, true) && result instanceof Collection<?>) {
+                    if (enabled(KEY_ANTI_RECALL, true) && isIncomingRecallContext()
+                            && !isLocalRecallContext() && result instanceof Collection<?>) {
                         for (Object message : (Collection<?>) result) {
                             if (message == null || intValue(message, "recallStatus", "mRecallStatus") != 0) {
                                 continue;
                             }
+                            if (messageIdentity(cl, message) >= 0) continue;
                             Object snapshot = cloneMessage(cl, message);
                             long mid = longValue(snapshot, "mid", "mMid");
                             recallSnapshots.put(mid, snapshot);
@@ -152,9 +164,45 @@ public final class DingTalkModule extends XposedModule {
                 .setId("restore-after-bulk-recall-notification")
                 .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                 .intercept(chain -> {
-                    Object result = chain.proceed();
+                    Set<Long> ownIds = new HashSet<>();
+                    int resolvedCount = 0;
+                    boolean foreign = false;
                     Object cidArg = chain.getArg(0);
-                    if (!enabled(KEY_ANTI_RECALL, true) || !(cidArg instanceof String)) return result;
+                    Object idsArg = chain.getArg(1);
+                    if (cidArg instanceof String && idsArg instanceof Iterable<?>) {
+                        // K() falls back to the database when the conversation is
+                        // not cached; I() only inspects the in-memory list.
+                        Method find = messageCache.getDeclaredMethod("K", String.class, long.class);
+                        find.setAccessible(true);
+                        for (Object id : (Iterable<?>) idsArg) {
+                            if (id instanceof Number) {
+                                Object message = find.invoke(chain.getThisObject(), cidArg,
+                                        ((Number) id).longValue());
+                                if (message != null) {
+                                    int identity = messageIdentity(cl, message);
+                                    if (identity != 0) resolvedCount++;
+                                    if (identity > 0) {
+                                        ownIds.add(((Number) id).longValue());
+                                    } else if (identity < 0) {
+                                        foreign = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ownRecallIds.set(ownIds);
+                    resolvedRecallCount.set(resolvedCount);
+                    containsForeignRecall.set(foreign);
+                    Object result;
+                    try {
+                        result = chain.proceed();
+                    } finally {
+                        ownRecallIds.remove();
+                        resolvedRecallCount.remove();
+                        containsForeignRecall.remove();
+                    }
+                    if (isLocalRecallContext()
+                            || !enabled(KEY_ANTI_RECALL, true) || !(cidArg instanceof String)) return result;
                     for (Object id : (List<?>) chain.getArg(1)) {
                         if (!(id instanceof Number)) continue;
                         Object snapshot = recallSnapshots.remove(((Number) id).longValue());
@@ -182,10 +230,123 @@ public final class DingTalkModule extends XposedModule {
                     if (!enabled(KEY_ANTI_RECALL, true)) return chain.proceed();
                     Object values = chain.getArg(2);
                     if (!isRecallUpdate(values)) return chain.proceed();
+                    // A direct ofi.f() call is also used by the local user's
+                    // own recall operation. Only guard f() while it is nested
+                    // inside the confirmed MessageCache.f0() batch path.
+                    if (!isIncomingRecallContext()) return chain.proceed();
+                    // Never block when the sender identity is unavailable.
+                    // This is important for the local user's "recalling..."
+                    // RPC callback, which can briefly lack a message object.
+                    Integer resolved = resolvedRecallCount.get();
+                    if (resolved == null || resolved == 0
+                            || !Boolean.TRUE.equals(containsForeignRecall.get())) {
+                        return chain.proceed();
+                    }
+                    if (containsOwnRecallId(chain.getArg(1))) return chain.proceed();
                     if (hasSnapshotForIds(chain.getArg(1))) return chain.proceed();
                     Log.i(TAG, "blocked background recall database update");
                     return Integer.valueOf(0);
                 });
+    }
+
+    /**
+     * The original DingTalk anti-recall module keeps the local recall action
+     * available by forcing MessageImpl.canRecall() to true. Do not intercept
+     * ofi.f() here: returning 0 from that database method leaves DingTalk's
+     * own recall request stuck at “recalling…”.
+     */
+    private void installRecallCapabilityHook(ClassLoader cl, Class<?> messageImpl)
+            throws Exception {
+        Method canRecall = messageImpl.getDeclaredMethod("canRecall");
+        hook(canRecall)
+                .setId("allow-local-recall-action")
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .intercept(chain -> enabled(KEY_ANTI_RECALL, true)
+                        ? Boolean.TRUE : chain.proceed());
+    }
+
+    /**
+     * DexSQL-confirmed incoming recall entry points. Local user recalls enter
+     * through MessageImpl$a0/MessageImpl$z and therefore never acquire this
+     * context.
+     */
+    private void installIncomingRecallContextHooks(ClassLoader cl) throws Exception {
+        Class<?> ack = Class.forName(
+                "com.laiwang.idl.client.push.ReceiverMessageHandler$AckCallback", false, cl);
+        Class<?> notice = Class.forName(
+                "com.alibaba.wukong.idl.im.models.MessageNoticeModel", false, cl);
+        Method noticeHandler = Class.forName("Ligi", false, cl).getDeclaredMethod(
+                "a", ack, notice);
+        hookIncomingContext(noticeHandler, "incoming-recall-notice-context");
+
+        Class<?> syncAck = Class.forName("com.alibaba.wukong.sync.SyncAck", false, cl);
+        Method syncHandler = Class.forName("Liji", false, cl).getDeclaredMethod(
+                "onReceived", List.class, syncAck);
+        hookIncomingContext(syncHandler, "incoming-recall-sync-context");
+    }
+
+    private void hookIncomingContext(Method method, String id) {
+        hook(method)
+                .setId(id)
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .intercept(chain -> {
+                    Integer depth = incomingRecallDepth.get();
+                    incomingRecallDepth.set(depth == null ? 1 : depth + 1);
+                    try {
+                        return chain.proceed();
+                    } finally {
+                        if (depth == null) incomingRecallDepth.remove();
+                        else incomingRecallDepth.set(depth);
+                    }
+        });
+    }
+
+    /**
+     * DexSQL-confirmed local recall paths. MessageImpl$a0 and MessageImpl$z
+     * call M0(), while MessageCache.g0()/h0() call f0(). Mark these stacks
+     * so anti-recall restoration cannot touch the user's own request.
+     */
+    private void installLocalRecallContextHooks(ClassLoader cl, Class<?> messageCache)
+            throws Exception {
+        Class<?> messageImpl = Class.forName(MESSAGE, false, cl);
+        Class<?> callback = Class.forName(CALLBACK, false, cl);
+        hookLocalContext(Class.forName(MESSAGE + "$a0", false, cl)
+                        .getDeclaredMethod("onExecuteRpc", Void.class, callback),
+                "local-recall-rpc-a0");
+        Class<?> epc = Class.forName("epe$c", false, cl);
+        hookLocalContext(Class.forName(MESSAGE + "$z", false, cl)
+                        .getDeclaredMethod("onAfterRpc", epc),
+                "local-recall-rpc-z");
+        hookLocalContext(messageCache.getDeclaredMethod("g0", String.class, messageImpl),
+                "local-recall-cache-g0");
+        hookLocalContext(messageCache.getDeclaredMethod("h0", String.class, List.class),
+                "local-recall-cache-h0");
+    }
+
+    private void hookLocalContext(Method method, String id) {
+        hook(method)
+                .setId(id)
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .intercept(chain -> {
+                    Integer depth = localRecallDepth.get();
+                    localRecallDepth.set(depth == null ? 1 : depth + 1);
+                    try {
+                        return chain.proceed();
+                    } finally {
+                        if (depth == null) localRecallDepth.remove();
+                        else localRecallDepth.set(depth);
+                    }
+                });
+    }
+
+    private static boolean isIncomingRecallContext() {
+        Integer depth = incomingRecallDepth.get();
+        return depth != null && depth > 0;
+    }
+
+    private static boolean isLocalRecallContext() {
+        Integer depth = localRecallDepth.get();
+        return depth != null && depth > 0;
     }
 
     private static boolean isRecallUpdate(Object values) {
@@ -200,6 +361,15 @@ public final class DingTalkModule extends XposedModule {
             if (id instanceof Number && recallSnapshots.containsKey(((Number) id).longValue())) {
                 return true;
             }
+        }
+        return false;
+    }
+
+    private static boolean containsOwnRecallId(Object ids) {
+        Set<Long> ownIds = ownRecallIds.get();
+        if (ownIds == null || ownIds.isEmpty() || !(ids instanceof Iterable<?>)) return false;
+        for (Object id : (Iterable<?>) ids) {
+            if (id instanceof Number && ownIds.contains(((Number) id).longValue())) return true;
         }
         return false;
     }
@@ -361,6 +531,32 @@ public final class DingTalkModule extends XposedModule {
             return name == null || name.length() == 0 || "null".equals(name) ? "对方" : name;
         } catch (Throwable t) {
             return "对方";
+        }
+    }
+
+    /** DexSQL-confirmed current-user path: UserEngineInterface.f().d(). */
+    private static boolean isOwnMessage(ClassLoader cl, Object message) {
+        return messageIdentity(cl, message) > 0;
+    }
+
+    /** Returns 1 for own, -1 for foreign, and 0 when identity is unavailable. */
+    private static int messageIdentity(ClassLoader cl, Object message) {
+        try {
+            long senderId = ((Number) invokeNoArg(message, "senderId")).longValue();
+            if (senderId <= 0) return 0;
+            Class<?> users = Class.forName(
+                    "com.alibaba.android.dingtalk.userbase.UserEngineInterface", false, cl);
+            Method factory = users.getDeclaredMethod("f");
+            factory.setAccessible(true);
+            Object engine = factory.invoke(null);
+            if (engine == null) return 0;
+            Method current = users.getDeclaredMethod("d");
+            current.setAccessible(true);
+            long currentId = ((Number) current.invoke(engine)).longValue();
+            if (currentId <= 0) return 0;
+            return senderId == currentId ? 1 : -1;
+        } catch (Throwable ignored) {
+            return 0;
         }
     }
 
