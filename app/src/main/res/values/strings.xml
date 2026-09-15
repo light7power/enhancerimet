@@ -1,0 +1,4 @@
+<resources>
+    <string name="module_name">钉钉增强 Modern</string>
+    <string name="module_description">基于 libxposed 的钉钉增强模块：支持消息防撤回、屏蔽已读，并提供本机配置生成与插件诊断修复。适用于 com.alibaba.android.rimet。</string>
+</resources>

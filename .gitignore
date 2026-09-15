@@ -1,0 +1,10 @@
+.gradle/
+build/
+app/build/
+local.properties
+*.iml
+.idea/
+
+# Local APKs and extracted test artifacts
+*.apk
+extracted-icons/
