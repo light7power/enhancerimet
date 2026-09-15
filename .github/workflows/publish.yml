@@ -26,10 +26,10 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build release APK
-        run: ./gradlew :app:assembleRelease
+        run: bash ./gradlew :app:assembleRelease
 
       - name: Publish Maven package
-        run: ./gradlew :app:publishReleasePublicationToGitHubPackagesRepository
+        run: bash ./gradlew :app:publishReleasePublicationToGitHubPackagesRepository
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
