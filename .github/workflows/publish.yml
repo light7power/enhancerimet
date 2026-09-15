@@ -25,7 +25,19 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build release APK
+      - name: Decode signing keystore
+        run: |
+          if [ -z "${{ secrets.SIGNING_KEYSTORE_BASE64 }}" ]; then
+            echo "::error::Secret SIGNING_KEYSTORE_BASE64 is not set"
+            exit 1
+          fi
+          echo "${{ secrets.SIGNING_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "SIGNING_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+          echo "SIGNING_KEYSTORE_PASSWORD=${{ secrets.SIGNING_KEYSTORE_PASSWORD }}" >> "$GITHUB_ENV"
+          echo "SIGNING_KEY_ALIAS=${{ secrets.SIGNING_KEY_ALIAS }}" >> "$GITHUB_ENV"
+          echo "SIGNING_KEY_PASSWORD=${{ secrets.SIGNING_KEY_PASSWORD }}" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK
         run: bash ./gradlew :app:assembleRelease
 
       - name: Publish Maven package
@@ -38,9 +50,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          prerelease: true
-          files: app/build/outputs/apk/release/app-release-unsigned.apk
+          files: app/build/outputs/apk/release/app-release.apk
           body: |
-            测试版本：Rimet 8.5.5 / versionCode 1274。
+            正式签名版：Rimet 8.5.5 / versionCode 1274。
 
             已知问题：部分场景下自己撤回消息仍可能停留在“消息撤回中…”，欢迎提交 Issue 或 Pull Request 协助修复。

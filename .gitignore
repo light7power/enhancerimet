@@ -8,3 +8,6 @@ local.properties
 # Local APKs and extracted test artifacts
 *.apk
 extracted-icons/
+
+# Release signing keystore (never commit)
+keystore/
